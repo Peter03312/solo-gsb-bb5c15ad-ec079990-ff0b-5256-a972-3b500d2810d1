@@ -73,16 +73,23 @@ CREATE TABLE IF NOT EXISTS investigations (
     status      TEXT NOT NULL DEFAULT 'open'
 );
 
--- 过敏原代码并码（同义代码合并）：质控登记 old_code -> target_code，每个旧代码
--- 只能登记一次（UNIQUE 强约束：同一旧代码改指其他目标在库层即被拒绝）；
--- target_code 后续自身也可被并码（串接），解析时沿链到最终规范代码。
--- 原料声明版本与标签快照中的原始代码永不改写出库，只在实时计算时按本表规范化。
+-- 过敏原代码并码（同义代码合并）：质控登记 old_code -> target_code。
+-- 并码登记有误可凭登记记录号 + 必填原因撤销**单条关系**：撤销行保留在表内
+-- （并码列表可查原登记及撤销原因、时间），但不再参与生效链解析；同一旧代码
+-- 撤销后可重新并入当前非别名目标（新登记为新的一行）。
+-- 库层约束：每个旧代码至多存在一条**生效中**的并码（部分唯一索引）——
+-- 生效中的同一旧代码改指其他目标在库层即被拒绝，撤销行不占名额。
+-- 原料声明版本与标签快照中的原始代码永不改写出库，只在实时计算时按本表中
+-- **仍生效**的行规范化。
 CREATE TABLE IF NOT EXISTS allergen_code_merges (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    old_code    TEXT NOT NULL UNIQUE,
-    target_code TEXT NOT NULL,
-    reason      TEXT NOT NULL,          -- 必填并码原因
-    merged_at   TEXT NOT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_code      TEXT NOT NULL,
+    target_code   TEXT NOT NULL,
+    reason        TEXT NOT NULL,          -- 必填并码原因
+    merged_at     TEXT NOT NULL,
+    revoked       INTEGER NOT NULL DEFAULT 0,  -- 1 = 已撤销（仅该行关系失效）
+    revoked_reason TEXT,                      -- 必填撤销原因
+    revoked_at    TEXT
 );
 
 -- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
@@ -99,7 +106,39 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_trace_events_batch ON trace_events(batch_id);
+
+-- 每个旧代码至多一条生效中的并码（撤销行保留但不占名额，撤销后可重新并码）。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allergen_merges_active_old
+    ON allergen_code_merges(old_code) WHERE revoked = 0;
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """幂等迁移：旧版 allergen_code_merges（old_code 列级 UNIQUE、无撤销列）
+    重建为新表结构并搬移既有行（id 保持不变，事件 op_ref.merge_id 不失效）。
+    新结构库直接跳过。启动即执行，无需额外初始化步骤。"""
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(allergen_code_merges)")}
+    if cols and "revoked" not in cols:
+        conn.executescript(
+            """
+            ALTER TABLE allergen_code_merges RENAME TO allergen_code_merges_old;
+            CREATE TABLE allergen_code_merges (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_code      TEXT NOT NULL,
+                target_code   TEXT NOT NULL,
+                reason        TEXT NOT NULL,
+                merged_at     TEXT NOT NULL,
+                revoked       INTEGER NOT NULL DEFAULT 0,
+                revoked_reason TEXT,
+                revoked_at    TEXT
+            );
+            INSERT INTO allergen_code_merges
+                (id, old_code, target_code, reason, merged_at)
+                SELECT id, old_code, target_code, reason, merged_at
+                FROM allergen_code_merges_old;
+            DROP TABLE allergen_code_merges_old;
+            """)
 
 
 def db_path() -> str:
@@ -117,6 +156,8 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     conn = connect()
     try:
+        # 先迁移旧版表结构（新库为空操作），再幂等建表/建索引。
+        _migrate(conn)
         conn.executescript(SCHEMA)
     finally:
         conn.close()

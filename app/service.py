@@ -59,20 +59,26 @@ def iso_z(s: str) -> str:
 # ---------------------------------------------------------------- 过敏原代码并码
 #
 # 质控登记的“旧过敏原代码 -> 目标代码”并码关系可串接（目标自身也可再被并码）。
-# 原料声明各版本与已签发标签快照中的原始代码**永不改写出库**；实时溯源时沿并码
-# 链把每条声明代码解析到**最终规范代码**：同义项合并为同一过敏原并按完整路径
-# 去重，每个声明步骤仍保留原始来源代码（allergen_code）与解析结果
-# （canonical_code），声明版本依据不变。并码登记与事件同事务原子提交。
+# 登记有误可凭并码记录号 + 必填原因**撤销单条关系**：撤销行保留（可查原登记及
+# 撤销原因/时间），但不再参与任何生效链解析；串接链按**仍生效**的关系解析
+# （A→B→C 中撤销 B→C 后 A 归 B，撤销 A→B 后 B 仍归 C）。同一旧代码撤销后可
+# 重新并入当前非别名目标（新登记产生新记录）；同向重试幂等仅对生效关系成立。
+# 原料声明各版本与已签发标签快照中的原始代码**永不改写出库**；实时溯源时沿
+# **生效**并码链把每条声明代码解析到**最终规范代码**：同义项合并为同一过敏原
+# 并按完整路径去重，每个声明步骤仍保留原始来源代码（allergen_code）与解析结果
+# （canonical_code），声明版本依据不变。登记/撤销与事件同事务原子提交。
 
 def _allergen_merge_map(conn: sqlite3.Connection) -> dict[str, str]:
-    """当前并码关系：{old_code: target_code}（每个旧代码至多一条）。"""
+    """当前**生效**并码关系：{old_code: target_code}（每个旧代码至多一条；
+    已撤销行不参与解析，撤销后旧代码重新成为规范代码，直到重新并码）。"""
     return {r["old_code"]: r["target_code"]
             for r in conn.execute(
-                "SELECT old_code, target_code FROM allergen_code_merges")}
+                "SELECT old_code, target_code FROM allergen_code_merges"
+                " WHERE revoked = 0")}
 
 
 def resolve_canonical(merge_map: dict[str, str], code: str) -> str:
-    """沿并码链解析最终规范代码（登记校验保证链无环，兜底防死循环）。"""
+    """沿生效并码链解析最终规范代码（登记校验保证链无环，兜底防死循环）。"""
     cur, seen = code, set()
     while cur in merge_map:
         if cur in seen:
@@ -83,11 +89,13 @@ def resolve_canonical(merge_map: dict[str, str], code: str) -> str:
 
 
 def _merge_chain(conn: sqlite3.Connection, code: str) -> list[dict]:
-    """从 code 起沿并码链返回每一跳登记记录（空链 = 自身即规范代码）。"""
+    """从 code 起沿**生效**并码链返回每一跳登记记录（空链 = 自身即规范代码）。
+    已撤销的跳不在沿革中出现——代码查询仅给出生效链的规范码与沿革。"""
     chain, cur, seen = [], code, set()
     while True:
         row = conn.execute(
-            "SELECT * FROM allergen_code_merges WHERE old_code = ?",
+            "SELECT * FROM allergen_code_merges"
+            " WHERE old_code = ? AND revoked = 0",
             (cur,)).fetchone()
         if not row:
             break
@@ -106,6 +114,10 @@ def _merge_view(row) -> dict:
         "target_code": row["target_code"],
         "reason": row["reason"],
         "merged_at": iso_z(row["merged_at"]),
+        "status": "revoked" if row["revoked"] else "active",
+        "revoked": bool(row["revoked"]),
+        "revoked_reason": row["revoked_reason"],
+        "revoked_at": iso_z(row["revoked_at"]) if row["revoked_at"] else None,
     }
 
 
@@ -123,10 +135,13 @@ def register_allergen_merge(conn: sqlite3.Connection, data):
     校验（全部在 BEGIN IMMEDIATE 事务内，失败回滚不留任何记录/事件）：
     - 旧代码与目标代码均非空（请求层 422），且不得自映射；
     - 旧代码须在现存原料声明（含历史版本）中出现；
-    - 目标代码当前不能是别名（即不能已存在以其为旧代码的并码），因此并码
-      只可能“接长”规范代码、链上不可能成环；
-    - 同一旧代码只能并码一次：改指其他目标 409 拒绝；完全相同的并码请求
-      视为同向重试，幂等返回原登记（200，不重复写、不产事件）。
+    - 目标代码当前不能是别名（即不能存在以其为旧代码的**生效**并码），因此
+      生效并码只可能“接长”规范代码、链上不可能成环；
+    - 每个旧代码同一时间只能有一条生效并码（部分唯一索引强约束）：生效中
+      改指其他目标 409 拒绝；完全相同的生效并码请求视为同向重试，幂等返回
+      原登记（200，不重复写、不产事件）；
+    - 该旧代码的旧关系**已撤销**时可重新并码（产生新记录，包括重新并回曾经的
+      目标）；撤销行不参与改指/重试判定。
     成功后按最终规范代码实时重算全部批次（含设备残留下游），仅为实际变化
     的批次按批次号顺序沿用既有事件字段记录 op=allergen_code_merge 事件。
     返回 (merge_view, replayed)。
@@ -137,14 +152,15 @@ def register_allergen_merge(conn: sqlite3.Connection, data):
             raise Conflict(
                 f"自映射拒绝：旧代码与目标代码相同（{old}）")
         existing = conn.execute(
-            "SELECT * FROM allergen_code_merges WHERE old_code = ?",
+            "SELECT * FROM allergen_code_merges"
+            " WHERE old_code = ? AND revoked = 0",
             (old,)).fetchone()
         if existing:
             if existing["target_code"] == target:
                 return _merge_view(existing), True  # 同向重试：返回原结果
             raise Conflict(
                 f"旧代码 {old} 已并入 {existing['target_code']}，"
-                f"不能改指其他目标 {target}")
+                f"不能改指其他目标 {target}（如需更正请先撤销原并码）")
         merge_map = _allergen_merge_map(conn)
         if target in merge_map:
             raise Conflict(
@@ -175,10 +191,62 @@ def register_allergen_merge(conn: sqlite3.Connection, data):
     return view, False
 
 
+def revoke_allergen_merge(conn: sqlite3.Connection, merge_id: int, data) -> dict:
+    """撤销单条过敏原代码并码关系（凭并码记录号 + 必填撤销原因）。
+
+    - 未知记录 404；已撤销记录重复撤销 409；空白原因请求层 422。
+    - 撤销仅使**该单条关系**失效：串接链按仍生效的关系解析（A→B→C 中撤销
+      B→C 后 A 归 B；撤销 A→B 后 B 仍归 C）。撤销行保留在表内，列表可查
+      原登记及撤销原因、时间；代码查询的沿革仅含仍生效的跳。
+    - 同一旧代码撤销后可重新并入当前非别名目标（新登记为新记录）。
+    - 原料声明各版本与已签发标签快照保持原始代码不变；撤销后全量重算受影响
+      批次（含设备残留下游），初始化快照反映新结论；仅为结论/路径/依据实际
+      变化的批次在同一事务按批次号顺序写入 op=allergen_code_merge_revocation
+      事件；历史事件不可改写。撤销同时使所有未提交的预演凭据失效（指纹纳入
+      全部并码行的生效状态与撤销信息）。
+    """
+    with write_tx(conn):
+        row = conn.execute(
+            "SELECT * FROM allergen_code_merges WHERE id = ?",
+            (merge_id,)).fetchone()
+        if not row:
+            raise NotFound(f"未知并码记录: {merge_id}")
+        if row["revoked"]:
+            raise Conflict(f"并码记录 {merge_id} 已撤销，不能重复撤销")
+
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
+        revoked_at = to_store(now_utc())
+        conn.execute(
+            "UPDATE allergen_code_merges"
+            " SET revoked = 1, revoked_reason = ?, revoked_at = ?"
+            " WHERE id = ? AND revoked = 0",
+            (data.reason, revoked_at, merge_id))
+        _record_events(
+            conn, "allergen_code_merge_revocation",
+            {"merge_id": merge_id, "old_code": row["old_code"],
+             "target_code": row["target_code"], "reason": data.reason},
+            before_views, before_releases=releases)
+        new_row = conn.execute(
+            "SELECT * FROM allergen_code_merges WHERE id = ?",
+            (merge_id,)).fetchone()
+        return _merge_view(new_row)
+
+
 def list_allergen_merges(conn: sqlite3.Connection) -> list[dict]:
+    """并码登记列表（按登记顺序；撤销行同样保留，带撤销原因/时间）。"""
     rows = conn.execute(
         "SELECT * FROM allergen_code_merges ORDER BY id").fetchall()
     return [_merge_view(r) for r in rows]
+
+
+def get_allergen_merge(conn: sqlite3.Connection, merge_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM allergen_code_merges WHERE id = ?",
+        (merge_id,)).fetchone()
+    if not row:
+        raise NotFound(f"未知并码记录: {merge_id}")
+    return _merge_view(row)
 
 
 def allergen_code_info(conn: sqlite3.Connection, code: str) -> dict:
@@ -1418,14 +1486,18 @@ def _collect_witnesses(conn: sqlite3.Connection, affected: dict,
         "cleanings": {},
         "labels": {str(i): labels[i] for i in sorted(labels)},
         "investigations": {},
-        # 当前并码关系整体纳入指纹：预演期间任何并码登记（即使发生在无关
-        # 原料链上）都改变“代码解释口径”，凭据必须失效、要求重新预演，
-        # 杜绝并码与声明更正并发提交产生混合状态。
+        # 当前并码关系整体纳入指纹（含每行的生效状态与撤销信息）：预演期间
+        # 任何并码登记或撤销（即使发生在无关原料链上）都改变“代码解释口径”，
+        # 凭据必须失效、要求重新预演，杜绝并码变动与声明更正并发提交产生
+        # 混合状态。
         "allergen_code_merges": [
-            {"old_code": r["old_code"], "target_code": r["target_code"]}
+            {"old_code": r["old_code"], "target_code": r["target_code"],
+             "revoked": int(r["revoked"]),
+             "revoked_reason": r["revoked_reason"],
+             "revoked_at": r["revoked_at"]}
             for r in conn.execute(
-                "SELECT old_code, target_code FROM allergen_code_merges"
-                " ORDER BY id")],
+                "SELECT old_code, target_code, revoked, revoked_reason,"
+                " revoked_at FROM allergen_code_merges ORDER BY id")],
     }
 
     for bid in sorted(materials):

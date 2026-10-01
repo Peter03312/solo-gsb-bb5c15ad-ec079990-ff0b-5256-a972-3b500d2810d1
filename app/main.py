@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .schemas import (
     AllergenCodeMergeCreate,
+    AllergenCodeMergeRevokeCreate,
     CleaningCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
@@ -30,11 +31,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.5.0",
+    version="1.6.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
                 "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存、"
-                "过敏原代码并码（旧代码并入目标代码、可串接、实时规范化），"
+                "过敏原代码并码（旧代码并入目标代码、可串接、可凭记录号撤销"
+                "单条关系、撤销后可重新并码、实时规范化），"
                 "以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
@@ -124,8 +126,30 @@ def create_allergen_merge(data: AllergenCodeMergeCreate,
 
 @app.get("/allergen-merges", tags=["过敏原代码并码"])
 def get_allergen_merges(conn=Depends(get_conn)):
-    """列出全部过敏原代码并码登记（按登记顺序，含串接链上的每一跳）。"""
+    """列出全部过敏原代码并码登记（按登记顺序；撤销行同样保留，
+    带撤销原因/时间，status=revoked）。"""
     return {"merges": service.list_allergen_merges(conn)}
+
+
+@app.get("/allergen-merges/{merge_id}", tags=["过敏原代码并码"])
+def get_allergen_merge(merge_id: int, conn=Depends(get_conn)):
+    """查询单条并码登记（含原登记信息及撤销原因/时间）。"""
+    return service.get_allergen_merge(conn, merge_id)
+
+
+@app.post("/allergen-merges/{merge_id}/revoke", tags=["过敏原代码并码"])
+def revoke_allergen_merge(merge_id: int, data: AllergenCodeMergeRevokeCreate,
+                          conn=Depends(get_conn)):
+    """撤销单条过敏原代码并码关系（凭并码记录号 + 必填撤销原因）。
+
+    仅该单条关系失效，串接链按仍生效的关系解析（A→B→C 中撤销 B→C 后
+    A 归 B，撤销 A→B 后 B 仍归 C）；撤销行保留可查，同一旧代码可重新并入
+    当前非别名目标。撤销后同事务重算受影响批次（含设备残留下游），初始化
+    快照反映新结论，仅为结论/路径/依据实际变化的批次写入有序事件，历史事件
+    不可改写；未提交的预演凭据失效。未知记录 404、重复撤销 409、空白原因
+    422，失败不留记录或事件。
+    """
+    return service.revoke_allergen_merge(conn, merge_id, data)
 
 
 @app.get("/allergen-codes/{code}", tags=["过敏原代码并码"])

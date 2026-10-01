@@ -112,6 +112,20 @@ class AllergenCodeMergeCreate(BaseModel):
         return v
 
 
+class AllergenCodeMergeRevokeCreate(BaseModel):
+    """过敏原代码并码撤销：撤销单条并码关系（必填撤销原因）。"""
+
+    reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+
 # 声明更正预演请求与正式更正同构；清洗撤销预演/凭据提交无请求体，
 # 仅以路径参数（清洗 id / 预演凭据）定位。
 class DeclarationPreviewCreate(DeclarationCreate):
