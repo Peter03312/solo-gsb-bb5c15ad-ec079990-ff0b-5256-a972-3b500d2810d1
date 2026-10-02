@@ -2,11 +2,14 @@
 
 质控把旧过敏原代码并入目标代码（必填原因）：并码可串接；目标须非空且当前
 不是别名；自映射、成环、同一旧代码改指其他目标一律拒绝且不留记录；同向重试
-幂等返回原结果。原料声明版本与已签发标签快照保留原值；实时溯源按最终规范
-代码合并同义项并去重，同时保留每条原始来源路径、声明版本，待确认状态不变；
-并码后重算受影响批次（含设备残留下游），沿用既有事件字段与全局顺序，仅为
-实际变化记录事件；并码与事件同事务；新原料登记/声明更正/预演按当前并码关系
-解释代码；既有接口字段与路径结构保持兼容。
+幂等返回原结果（仅对仍生效的关系）。质控发现登记有误可凭并码记录号 + 必填
+原因撤销单条关系：串接链按仍生效的关系解析，撤销后旧代码可重新并入当前非
+别名目标（另起新记录，原撤销记录保留可查：原登记、撤销原因/时间）。原料
+声明版本与已签发标签快照保留原值；实时溯源按最终规范代码合并同义项并去重，
+同时保留每条原始来源路径、声明版本，待确认状态不变；并码登记/撤销后重算
+受影响批次（含设备残留下游），沿用既有事件字段与全局顺序，仅为实际变化
+记录事件（历史事件不可改写）；撤销使未提交的预演凭据失效；既有接口字段与
+路径结构保持兼容。
 """
 import os
 import tempfile
@@ -53,6 +56,11 @@ def processing(c, pid, eq, start, end, inputs, outputs):
 def merge(c, old, target, reason="同义词并码"):
     return c.post("/allergen-merges", json={
         "old_code": old, "target_code": target, "reason": reason})
+
+
+def revoke(c, merge_id, reason="质控复核撤销"):
+    return c.post(f"/allergen-merges/{merge_id}/revoke",
+                  json={"reason": reason})
 
 
 # ---------------------------------------------------------------- 登记校验
@@ -346,3 +354,252 @@ def test_existing_trace_fields_and_paths_remain_compatible(client):
     assert step["batch_id"] == "RM-1" and step["via"] == "declaration"
     # 无并码时步骤与原结构一致（不额外带代码字段）
     assert "allergen_code" not in step
+
+
+# ---------------------------------------------------------------- 并码撤销
+
+def test_revoke_unknown_record_404_without_event(client):
+    material(client, "RM-1", allergens=["milk"])
+    before = client.get("/changes/events?cursor=0&limit=1").json()["latest"]
+    r = revoke(client, 9999)
+    assert r.status_code == 404
+    after = client.get("/changes/events?cursor=0&limit=1").json()["latest"]
+    assert before == after  # 不留事件
+    assert client.get("/allergen-merges").json()["merges"] == []
+
+
+def test_revoke_requires_nonblank_reason(client):
+    material(client, "RM-1", allergens=["casein", "milk"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    r = client.post(f"/allergen-merges/{mid}/revoke", json={"reason": "   "})
+    assert r.status_code == 422
+    # 缺字段同样 422
+    assert client.post(f"/allergen-merges/{mid}/revoke", json={}).status_code == 422
+    # 关系仍生效
+    assert client.get("/allergen-merges?status=active").json()["merges"][0]["revoked"] is False
+
+
+def test_revoke_twice_rejected(client):
+    material(client, "RM-1", allergens=["casein", "milk"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    assert revoke(client, mid, reason="第一次撤销").status_code == 200
+    r = revoke(client, mid, reason="再次撤销")
+    assert r.status_code == 409
+    body = client.get("/allergen-merges?status=revoked").json()["merges"][0]
+    assert body["revoke_reason"] == "第一次撤销"  # 原因不被覆盖
+
+
+def test_chain_resolves_only_effective_relations(client):
+    # A(casein) -> B(dairy) -> C(milk)
+    material(client, "RM-1", allergens=["casein", "dairy", "milk"])
+    ab = merge(client, "casein", "dairy").json()["merge_id"]
+    bc = merge(client, "dairy", "milk").json()["merge_id"]
+    assert client.get("/allergen-codes/casein").json()["canonical_code"] == "milk"
+    # 撤销 B->C 后：A 归 B（casein->dairy），B 归自身
+    assert revoke(client, bc).status_code == 200
+    info = client.get("/allergen-codes/casein").json()
+    assert info["canonical_code"] == "dairy"
+    assert info["is_alias"] is True
+    assert [(h["old_code"], h["target_code"]) for h in info["history"]] == [
+        ("casein", "dairy")]  # 已撤销边不出现在生效链沿革
+    assert client.get("/allergen-codes/dairy").json()["canonical_code"] == "dairy"
+    # 再撤销 A->B 后：B 仍归 C？——B->C 已撤销，故 B 归自身
+    assert revoke(client, ab).status_code == 200
+    assert client.get("/allergen-codes/casein").json()["canonical_code"] == "casein"
+    assert client.get("/allergen-codes/casein").json()["history"] == []
+    assert client.get("/allergen-codes/dairy").json()["canonical_code"] == "dairy"
+
+
+def test_revoke_middle_edge_keeps_upper_chain(client):
+    # A->B->C，撤销 A->B 后 B 仍归 C（B->C 继续生效）
+    material(client, "RM-1", allergens=["casein", "dairy", "milk"])
+    ab = merge(client, "casein", "dairy").json()["merge_id"]
+    merge(client, "dairy", "milk")
+    revoke(client, ab)
+    assert client.get("/allergen-codes/casein").json()["canonical_code"] == "casein"
+    info_b = client.get("/allergen-codes/dairy").json()
+    assert info_b["canonical_code"] == "milk"
+    assert [(h["old_code"], h["target_code"]) for h in info_b["history"]] == [
+        ("dairy", "milk")]
+
+
+def test_merge_list_keeps_original_and_revocation_info(client):
+    material(client, "RM-1", allergens=["casein", "milk"])
+    mid = merge(client, "casein", "milk", reason="登记原因").json()["merge_id"]
+    rv = revoke(client, mid, reason="质控复核：登记有误").json()
+    assert rv["revoked"] is True
+    assert rv["revoke_reason"] == "质控复核：登记有误"
+    assert rv["revoked_at"]
+    assert rv["reason"] == "登记原因"          # 原登记原因保留
+    assert rv["old_code"] == "casein" and rv["target_code"] == "milk"
+    # 列表可查原登记及撤销原因、时间
+    entry = client.get("/allergen-merges").json()["merges"][0]
+    assert entry["merge_id"] == mid
+    assert entry["revoked"] is True
+    assert entry["revoke_reason"] == "质控复核：登记有误" and entry["revoked_at"]
+    # 过滤
+    assert client.get("/allergen-merges?status=revoked").json()["merges"][0]["merge_id"] == mid
+    assert client.get("/allergen-merges?status=active").json()["merges"] == []
+    assert client.get("/allergen-merges?status=bad").status_code == 400
+    # 生效记录不带撤销键
+    mid2 = merge(client, "casein", "milk", reason="重新登记").json()["merge_id"]
+    active = client.get("/allergen-merges?status=active").json()["merges"][0]
+    assert active["merge_id"] == mid2 and "revoke_reason" not in active
+    assert "revoked_at" not in active
+
+
+def test_remerge_after_revoke_allows_new_nonalias_target(client):
+    material(client, "RM-1", allergens=["casein", "milk", "gluten"])
+    old = merge(client, "casein", "milk").json()["merge_id"]
+    revoke(client, old)
+    # 撤销后重新并入当前非别名目标（milk 已不是 casein 的目标别名约束对象）
+    r = merge(client, "casein", "gluten", reason="纠正：酪蛋白不归奶")
+    assert r.status_code == 201
+    new_id = r.json()["merge_id"]
+    assert new_id != old  # 另起记录，原撤销记录保留
+    assert client.get("/allergen-codes/casein").json()["canonical_code"] == "gluten"
+    # 原撤销记录仍可查
+    revoked = {m["merge_id"]: m for m in
+               client.get("/allergen-merges?status=revoked").json()["merges"]}
+    assert old in revoked and revoked[old]["revoked"] is True
+
+
+def test_illegal_remerge_rejected_without_record_or_event(client):
+    material(client, "RM-1", allergens=["casein", "dairy", "milk"])
+    merge(client, "casein", "milk")
+    merge(client, "dairy", "milk")  # dairy 当前是别名
+    # 生效关系未撤销直接改指 -> 409，不留新记录
+    assert merge(client, "casein", "dairy").status_code == 409
+    active = {m["old_code"]: m for m in
+              client.get("/allergen-merges?status=active").json()["merges"]}
+    revoke(client, active["casein"]["merge_id"])
+    before = client.get("/allergen-merges").json()["merges"]
+    # 撤销后并入“当前别名”目标 dairy（dairy->milk 仍生效）-> 409
+    r2 = merge(client, "casein", "dairy")
+    assert r2.status_code == 409 and "别名" in r2.json()["detail"]
+    after = client.get("/allergen-merges").json()["merges"]
+    assert before == after  # 非法再并码不留记录
+    # 撤销后自映射依旧 409
+    assert merge(client, "casein", "casein").status_code == 409
+    # 撤销后旧代码未在声明中出现的校验仍有效（构造一个未声明代码）
+    assert merge(client, "wheat", "milk", reason="x").status_code == 400
+    assert client.get("/allergen-merges").json()["merges"] == after
+
+
+def test_same_direction_retry_idempotent_only_for_effective_relation(client):
+    material(client, "RM-1", allergens=["casein", "milk", "gluten"])
+    old = merge(client, "casein", "milk", reason="原登记").json()["merge_id"]
+    revoke(client, old)
+    # 撤销后以相同 old/target 再请求：不是幂等重试，而是新登记
+    r = merge(client, "casein", "milk", reason="重新并入")
+    assert r.status_code == 201 and r.json()["merge_id"] != old
+    # 新关系生效后同向重试才幂等
+    again = merge(client, "casein", "milk", reason="再来一次")
+    assert again.status_code == 200
+    assert again.json()["merge_id"] == r.json()["merge_id"]
+    assert again.json()["reason"] == "重新并入"
+
+
+def test_revoke_recalculates_trace_and_residue_downstream(client):
+    material(client, "RM-MILK", allergens=["casein"],
+             declared_at="2026-01-02T06:00:00Z")
+    material(client, "RM-OAT", allergens=["gluten"],
+             declared_at="2026-01-02T06:00:00Z")
+    processing(client, "P1", "EQ-1",
+               "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+               ["RM-MILK"], ["OUT-MILK-1"])
+    processing(client, "P2", "EQ-1",
+               "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+               ["RM-OAT"], ["OUT-OAT-1"])  # 残留
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    assert "milk" in client.get("/batches/OUT-OAT-1/trace").json()["allergens"]
+    revoke(client, mid)
+    # 撤销后规范口径回到原始代码 casein（含设备残留下游）
+    t = client.get("/batches/OUT-OAT-1/trace").json()
+    assert t["allergens"] == ["casein", "gluten"]
+    assert "milk" not in t["allergens"]
+    step = t["allergen_paths"]["casein"][0][0]
+    assert "allergen_code" not in step  # 已非别名：声明步骤回到原结构
+
+
+def test_revoke_records_ordered_events_only_for_changes(client):
+    material(client, "RM-A", allergens=["casein"])
+    material(client, "RM-Z", allergens=["gluten"])  # 无关批次
+    processing(client, "P1", "EQ-1",
+               "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+               ["RM-A"], ["OUT-1"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    snap = client.get("/changes/snapshot").json()
+    # 撤销前历史事件不可改写：记录撤销时刻点
+    pre_events = client.get(
+        f"/changes/events?cursor=0&limit=100").json()["events"]
+    revoke(client, mid)
+    ev = client.get(
+        f"/changes/events?cursor={snap['cursor']}&limit=100").json()["events"]
+    assert {e["batch_id"] for e in ev} == {"RM-A", "OUT-1"}
+    assert all(e["op"] == "allergen_code_merge_revocation" for e in ev)
+    assert [e["batch_id"] for e in ev] == sorted(e["batch_id"] for e in ev)
+    out = next(e for e in ev if e["batch_id"] == "OUT-1")
+    assert out["before"]["conclusion"]["allergens"] == ["milk"]
+    assert out["after"]["conclusion"]["allergens"] == ["casein"]
+    assert out["op_ref"] == {"merge_id": mid, "old_code": "casein",
+                             "target_code": "milk", "revoke_reason": "质控复核撤销"}
+    # 历史事件（撤销前的 allergen_code_merge 事件）仍原样存在
+    post_events = client.get(
+        f"/changes/events?cursor=0&limit=100").json()["events"]
+    assert len(post_events) == len(pre_events) + 2
+    assert any(e["op"] == "allergen_code_merge" for e in post_events)
+
+
+def test_revoke_keeps_raw_declarations_and_label_snapshots(client):
+    material(client, "RM-1", allergens=["casein"])
+    processing(client, "P1", "EQ-1",
+               "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+               ["RM-1"], ["OUT-1"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    label = client.post("/batches/OUT-1/labels", json={}).json()
+    revoke(client, mid)
+    # 原料原始声明代码不变
+    assert client.get("/materials/RM-1").json()["allergens"] == ["casein"]
+    # 已签发标签快照保持撤销前结论（milk），新实时结论回到 casein
+    frozen = client.get(f"/labels/{label['label_id']}").json()
+    assert frozen["conclusion"]["allergens"] == ["milk"]
+    assert client.get("/batches/OUT-1/trace").json()["allergens"] == ["casein"]
+
+
+def test_revoke_invalidates_outstanding_preview(client):
+    material(client, "RM-1", allergens=["milk"])
+    prev = client.post("/materials/RM-1/declarations/preview",
+                       json={"allergens": ["soy"]}).json()
+    token = prev["preview_id"]
+    material(client, "RM-2", allergens=["casein", "milk"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    revoke(client, mid)  # 撤销（即使发生在无关链路上）使凭据失效
+    r = client.post(f"/previews/{token}/commit")
+    assert r.status_code == 409
+
+
+def test_failed_revoke_leaves_no_trace_change(client):
+    material(client, "RM-1", allergens=["casein", "milk"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    before_max = client.get("/changes/events?cursor=0&limit=1").json()["latest"]
+    # 重复撤销与未知记录均不产事件
+    revoke(client, mid)
+    assert revoke(client, mid).status_code == 409
+    assert revoke(client, mid + 9999).status_code == 404
+    after_max = client.get("/changes/events?cursor=0&limit=1").json()["latest"]
+    # 仅第一次合法撤销的事件（RM-1）
+    assert after_max - before_max == 1
+
+
+def test_snapshot_reflects_conclusion_after_revoke(client):
+    material(client, "RM-1", allergens=["casein"])
+    processing(client, "P1", "EQ-1",
+               "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+               ["RM-1"], ["OUT-1"])
+    mid = merge(client, "casein", "milk").json()["merge_id"]
+    revoke(client, mid)
+    snap = client.get("/changes/snapshot").json()
+    allergens = {b["batch_id"]: b["conclusion"]["allergens"]
+                 for b in snap["batches"]}
+    assert allergens == {"RM-1": ["casein"], "OUT-1": ["casein"]}

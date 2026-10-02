@@ -74,16 +74,26 @@ CREATE TABLE IF NOT EXISTS investigations (
 );
 
 -- 过敏原代码并码（同义代码合并）：质控登记 old_code -> target_code，每个旧代码
--- 只能登记一次（UNIQUE 强约束：同一旧代码改指其他目标在库层即被拒绝）；
--- target_code 后续自身也可被并码（串接），解析时沿链到最终规范代码。
--- 原料声明版本与标签快照中的原始代码永不改写出库，只在实时计算时按本表规范化。
+-- 同一时刻只能有一条**生效（revoked=0）**并码（部分 UNIQUE 索引强约束）；
+-- target_code 后续自身也可被并码（串接），解析时沿生效关系链到最终规范代码。
+-- 质控发现登记有误时可凭并码记录号 + 必填原因撤销（revoked=1，并留撤销原因/
+-- 时间）；撤销后该旧代码可重新并入“当前非别名”的目标，新登记另起记录，
+-- 原撤销记录保留可查。原料声明版本与标签快照中的原始代码永不改写出库，
+-- 只在实时计算时按本表**仍生效**的关系规范化。
 CREATE TABLE IF NOT EXISTS allergen_code_merges (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    old_code    TEXT NOT NULL UNIQUE,
+    old_code    TEXT NOT NULL,
     target_code TEXT NOT NULL,
     reason      TEXT NOT NULL,          -- 必填并码原因
-    merged_at   TEXT NOT NULL
+    merged_at   TEXT NOT NULL,
+    revoked          INTEGER NOT NULL DEFAULT 0,  -- 1 = 已撤销（关系不再生效，记录保留）
+    revoke_reason    TEXT,                          -- 必填撤销原因
+    revoked_at       TEXT                           -- 撤销时间（UTC）
 );
+
+-- 仅对仍生效的关系限定 old_code 唯一；撤销后该旧代码允许重新并码。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allergen_merges_active_old
+    ON allergen_code_merges(old_code) WHERE revoked = 0;
 
 -- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
 -- seq 全局递增；同一次操作产生的多条事件按批次号排序（插入序即批次号序）。
@@ -101,6 +111,46 @@ CREATE TABLE IF NOT EXISTS trace_events (
 CREATE INDEX IF NOT EXISTS idx_trace_events_batch ON trace_events(batch_id);
 """
 
+# 旧版 allergen_code_merges 在 old_code 上带表级 UNIQUE（自动索引
+# sqlite_autoindex_allergen_code_merges_*）且无撤销列；升级时整表重建：
+# 现存关系作为“仍生效”关系迁入，撤销列置空，并以部分唯一索引替代旧约束。
+_MERGE_REBUILD_SQL = """
+CREATE TABLE allergen_code_merges_new (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_code    TEXT NOT NULL,
+    target_code TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    merged_at   TEXT NOT NULL,
+    revoked          INTEGER NOT NULL DEFAULT 0,
+    revoke_reason    TEXT,
+    revoked_at       TEXT
+);
+INSERT INTO allergen_code_merges_new
+    (id, old_code, target_code, reason, merged_at, revoked, revoke_reason, revoked_at)
+SELECT id, old_code, target_code, reason, merged_at, 0, NULL, NULL
+FROM allergen_code_merges;
+DROP TABLE allergen_code_merges;
+ALTER TABLE allergen_code_merges_new RENAME TO allergen_code_merges;
+CREATE UNIQUE INDEX idx_allergen_merges_active_old
+    ON allergen_code_merges(old_code) WHERE revoked = 0;
+"""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """一次性结构迁移：把旧版（old_code 表级 UNIQUE、无撤销列）并码表升级为
+    可撤销/可重新并码的新结构。新库无需迁移。"""
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(allergen_code_merges)").fetchall()}
+    if not cols or "revoked" in cols:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executescript(_MERGE_REBUILD_SQL)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
 
 def db_path() -> str:
     return os.environ.get("DB_PATH", "app.db")
@@ -117,6 +167,9 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     conn = connect()
     try:
+        # 先迁移旧版并码表（SCHEMA 中的部分唯一索引依赖新列，须在执行
+        # SCHEMA 建索引前完成整表重建），再幂等建表/索引。
+        _migrate(conn)
         conn.executescript(SCHEMA)
     finally:
         conn.close()

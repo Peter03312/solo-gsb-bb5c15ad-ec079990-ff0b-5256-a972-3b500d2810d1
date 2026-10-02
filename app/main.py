@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .schemas import (
     AllergenCodeMergeCreate,
+    AllergenCodeMergeRevokeCreate,
     CleaningCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
@@ -30,11 +31,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.5.0",
+    version="1.6.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
                 "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存、"
-                "过敏原代码并码（旧代码并入目标代码、可串接、实时规范化），"
+                "过敏原代码并码（旧代码并入目标代码、可串接、实时规范化、"
+                "可凭并码记录号+必填原因撤销单条关系、撤销后可重新并码），"
                 "以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
@@ -114,6 +116,7 @@ def create_allergen_merge(data: AllergenCodeMergeCreate,
     任何记录或事件）。完全相同的并码请求视为同向重试，幂等返回原登记
     （200，不重复写、不产事件）；新登记返回 201。并码可串接；并码后实时
     溯源按最终规范代码合并同义项并去重，原料声明版本与标签快照保留原值。
+    旧关系已撤销时允许把同一旧代码重新并入当前非别名目标（另起新记录）。
     """
     view, replayed = service.register_allergen_merge(conn, data)
     body = {**view, "replayed": replayed}
@@ -122,10 +125,32 @@ def create_allergen_merge(data: AllergenCodeMergeCreate,
     return body
 
 
+@app.post("/allergen-merges/{merge_id}/revoke", status_code=200,
+          tags=["过敏原代码并码"])
+def revoke_allergen_merge(merge_id: int, data: AllergenCodeMergeRevokeCreate,
+                          conn=Depends(get_conn)):
+    """撤销单条过敏原代码并码关系（凭并码记录号 + 必填原因）。
+
+    撤销只令该关系失效（原登记与撤销原因/时间保留可查），串接链按仍生效
+    的关系解析；撤销后重算受影响批次（含设备残留下游），仅为结论、路径或
+    依据实际变化的批次在同一事务写入有序变更事件（历史事件不可改写）；
+    原料声明版本与已签发标签快照的原始代码不变；未提交的预演凭据失效。
+    未知记录 404、重复撤销 409、空白原因 422，失败不留任何记录或事件。
+    撤销后该旧代码可重新并入当前非别名目标。
+    """
+    return service.revoke_allergen_merge(conn, merge_id, data.reason)
+
+
 @app.get("/allergen-merges", tags=["过敏原代码并码"])
-def get_allergen_merges(conn=Depends(get_conn)):
-    """列出全部过敏原代码并码登记（按登记顺序，含串接链上的每一跳）。"""
-    return {"merges": service.list_allergen_merges(conn)}
+def get_allergen_merges(status: str | None = None, conn=Depends(get_conn)):
+    """列出全部过敏原代码并码登记（按记录号顺序，含串接链上的每一跳）。
+
+    可按 ?status=active/revoked 过滤；已撤销记录附撤销原因与撤销时间，
+    原登记信息（旧/目标代码、登记原因、登记时间）保持可查。
+    """
+    if status not in (None, "active", "revoked"):
+        raise service.BadRequest("status 仅支持 active / revoked")
+    return {"merges": service.list_allergen_merges(conn, status)}
 
 
 @app.get("/allergen-codes/{code}", tags=["过敏原代码并码"])
